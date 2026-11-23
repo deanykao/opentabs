@@ -11,7 +11,7 @@ export const getCurrentUser = defineTool({
   group: 'People',
   input: z.object({}),
   output: z.object({
-    mri: z.string().describe('User MRI identifier (e.g., "8:live:username")'),
+    mri: z.string().describe('User MRI identifier (e.g., "8:orgid:<guid>")'),
     email: z.string().describe('Sign-in email address'),
   }),
   handle: async () => {

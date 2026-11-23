@@ -6,7 +6,7 @@ export const createChat = defineTool({
   name: 'create_chat',
   displayName: 'Create Chat',
   description:
-    'Create a new chat conversation with one or more users. Pass user MRIs (e.g., "8:live:username") as members. The current user is added automatically.',
+    'Create a new chat conversation with one or more users. Pass user MRIs (e.g., "8:orgid:<guid>") as members. The current user is added automatically.',
   summary: 'Create a new chat conversation',
   icon: 'plus-circle',
   group: 'Chats',

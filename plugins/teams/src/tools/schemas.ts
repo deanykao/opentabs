@@ -57,8 +57,10 @@ const mentionSchema = z.object({
 
 const fileSchema = z.object({
   title: z.string().describe('File name'),
-  type: z.string().describe('File type (e.g., "image/png", "application/pdf")'),
-  url: z.string().describe('File download URL'),
+  type: z.string().describe('File type/extension (e.g., "png", "pdf")'),
+  url: z.string().describe('File object URL (SharePoint/OneDrive; opening it requires the signed-in browser session)'),
+  share_url: z.string().describe('Sharing URL if the file has one, else empty'),
+  item_id: z.string().describe('Teams/SharePoint file item ID'),
 });
 
 // ---------------------------------------------------------------------------
@@ -66,10 +68,16 @@ const fileSchema = z.object({
 // ---------------------------------------------------------------------------
 
 export const messageSchema = z.object({
-  id: z.string().describe('Message ID (timestamp-based)'),
+  id: z
+    .string()
+    .describe(
+      'Message ID (arrival time in epoch ms); pass to edit_message, delete_message, set_reaction, remove_reaction',
+    ),
   client_message_id: z.string().describe('Client-assigned message ID'),
   content: z.string().describe('Message content (may contain HTML)'),
-  message_type: z.string().describe('Message type (e.g., "RichText/Html", "Text")'),
+  message_type: z
+    .string()
+    .describe('Message type (e.g., "RichText/Html", "Text", "ThreadActivity/AddMember", "RichText/Media_Card")'),
   from: z.string().describe('Sender MRI (e.g., "8:orgid:username")'),
   display_name: z.string().describe('Sender display name'),
   compose_time: z.string().describe('When the message was composed (ISO 8601)'),
@@ -77,6 +85,7 @@ export const messageSchema = z.object({
   mentions: z.array(mentionSchema).describe('Users mentioned in this message'),
   files: z.array(fileSchema).describe('Files attached to this message'),
   reactions: z.array(z.string()).describe('Reaction emoji keys on this message (e.g., ["like", "heart"])'),
+  is_deleted: z.boolean().describe('Whether the message was deleted (its content is then empty)'),
 });
 
 export type Message = z.infer<typeof messageSchema>;
@@ -88,8 +97,13 @@ interface RawMention {
 
 interface RawFile {
   title?: string;
+  fileName?: string;
   type?: string;
+  fileType?: string;
   objectUrl?: string;
+  itemid?: string;
+  id?: string;
+  fileInfo?: { fileUrl?: string | null; shareUrl?: string | null };
 }
 
 interface RawMessage {
@@ -104,10 +118,11 @@ interface RawMessage {
   properties?: {
     mentions?: string;
     files?: string;
-    emotions?: Array<{ key?: string }>;
+    emotions?: Array<{ key?: string; users?: unknown[] }>;
+    deletetime?: number | string;
   };
   annotationsSummary?: {
-    emotions?: Array<{ key?: string }>;
+    emotions?: Array<{ key?: string; users?: unknown[] }>;
   };
 }
 
@@ -129,22 +144,32 @@ const parseMentions = (raw?: string): Array<{ mri: string; display_name: string 
 };
 
 /** Parse files from the serialized JSON string in properties.files. */
-const parseFiles = (raw?: string): Array<{ title: string; type: string; url: string }> => {
+const parseFiles = (raw?: string): Message['files'] => {
   if (!raw) return [];
   try {
     const arr = JSON.parse(raw) as RawFile[];
-    return arr.map(f => ({ title: f.title ?? '', type: f.type ?? '', url: f.objectUrl ?? '' }));
+    return arr.map(f => ({
+      title: f.title || f.fileName || '',
+      type: f.fileType || f.type || '',
+      url: f.objectUrl || f.fileInfo?.fileUrl || '',
+      share_url: f.fileInfo?.shareUrl ?? '',
+      item_id: f.itemid || f.id || '',
+    }));
   } catch {
     return [];
   }
 };
 
-/** Extract unique reaction keys from emotions/annotationsSummary. */
+/**
+ * Extract unique reaction keys from emotions/annotationsSummary. Removing the last
+ * reaction of a kind leaves its entry behind with an empty `users` list, so only
+ * entries with at least one reacting user (or no user list at all) count.
+ */
 const parseReactions = (msg: RawMessage): string[] => {
   const emotions = msg.properties?.emotions ?? msg.annotationsSummary?.emotions ?? [];
   const keys = new Set<string>();
   for (const e of emotions) {
-    if (e.key) keys.add(e.key);
+    if (e.key && (!Array.isArray(e.users) || e.users.length > 0)) keys.add(e.key);
   }
   return [...keys];
 };
@@ -161,4 +186,5 @@ export const mapMessage = (m: RawMessage): Message => ({
   mentions: parseMentions(m.properties?.mentions),
   files: parseFiles(m.properties?.files),
   reactions: parseReactions(m),
+  is_deleted: Boolean(m.properties?.deletetime),
 });

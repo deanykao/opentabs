@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { threadApi } from '../teams-api.js';
 
 const memberSchema = z.object({
-  id: z.string().describe('Member MRI (e.g., "8:live:username")'),
+  id: z.string().describe('Member MRI (e.g., "8:orgid:<guid>")'),
   role: z.string().describe('Member role (e.g., "Admin", "User")'),
 });
 

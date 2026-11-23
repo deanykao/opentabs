@@ -18,7 +18,7 @@
   ],
   "opentabs": {
     "displayName": "Microsoft Teams",
-    "description": "OpenTabs plugin for Microsoft Teams",
+    "description": "Microsoft Teams — read, search and send chat messages, read and post team channel messages, reactions, and presence",
     "urlPatterns": [
       "*://teams.live.com/*",
       "*://teams.microsoft.com/*",
@@ -47,7 +47,8 @@
     "lint:fix": "biome lint --fix src/",
     "format:check": "biome format src/",
     "format": "biome format --write src/",
-    "check": "npm run build && npm run type-check && npm run lint && npm run format:check"
+    "check": "npm run build && npm run type-check && npm run lint && npm run format:check",
+    "test": "vitest run"
   },
   "peerDependencies": {
     "zod": "^4.0.0"
@@ -56,10 +57,12 @@
     "@opentabs-dev/plugin-sdk": "^0.0.115"
   },
   "devDependencies": {
-    "@opentabs-dev/plugin-tools": "^0.0.115",
     "@biomejs/biome": "2.4.6",
+    "@opentabs-dev/plugin-tools": "^0.0.115",
+    "ajv": "^8.20.0",
     "jiti": "^2.6.1",
     "typescript": "^6.0.3",
+    "vitest": "^5.1.1",
     "zod": "^4.3.6"
   },
   "license": "MIT",

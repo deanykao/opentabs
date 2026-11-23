@@ -4,31 +4,24 @@ import { definePreScript } from '@opentabs-dev/plugin-sdk/pre-script';
  * Pre-script for the Teams plugin.
  *
  * Runs at document_start in MAIN world, strictly before any page script.
- * Three token capture paths run in parallel:
+ * Two capture paths run in parallel:
  *
  * 1. **MSAL localStorage observer** — scans existing localStorage entries and
  *    hooks `Storage.prototype.setItem` to catch future writes. Recognises MSAL
  *    credential entries by their *value* shape (`credentialType`, `target`,
- *    `secret`, `expiresOn`). Works for classic Teams (`teams.microsoft.com`
- *    without `/v2/`), where MSAL stores tokens in plaintext.
+ *    `secret`, `expiresOn`) and stashes the Skype API access token and the
+ *    sign-in name from the ID token. The adapter also reads the MSAL cache
+ *    directly (it is plaintext on current Teams builds); this capture is the
+ *    fallback for the moments before the cache is populated.
  *
- * 2. **Loki token observer** — hooks `sessionStorage.setItem` to capture the
- *    raw `LokiAuthToken` JWT that Teams v2 (`teams.microsoft.com/v2/`) stores
- *    in sessionStorage. Used only as a readiness signal (`isReady()`); its
- *    audience (`394866fc-…`) is not accepted by the Skype authz endpoint.
- *
- * 3. **authsvc fetch interceptor** — wraps `window.fetch` to intercept Teams'
+ * 2. **authsvc fetch interceptor** — wraps `window.fetch` to intercept Teams'
  *    own POST to `/api/authsvc/v1.0/authz` (and the consumer equivalent). When
- *    Teams exchanges its MSAL Skype token for a Skype JWT during startup, we
- *    clone the response body and stash the resulting JWT under `skypeJwt`. The
- *    adapter reads this directly, bypassing the need for its own authsvc call.
- *    This is the primary auth path for Teams v2, where MSAL tokens are stored
- *    encrypted and cannot be read from localStorage directly.
+ *    Teams exchanges its MSAL Skype token for a Skype JWT, we clone the
+ *    response body and stash the resulting JWT under `skypeJwt`.
  *
  * Adapter reads via `getPreScriptValue` keys:
  *   - `consumerToken`  → { secret, expiresOn } MSAL Skype token for teams.live.com
- *   - `enterpriseToken`→ { secret, expiresOn } MSAL Skype token for teams.microsoft.com
- *   - `lokiToken`      → { secret, expiresOn } LokiAuthToken (readiness signal only)
+ *   - `enterpriseToken`→ { secret, expiresOn } MSAL Skype token for enterprise Teams
  *   - `skypeJwt`       → { secret, expiresOn } Skype JWT captured from authsvc response
  *   - `signInName`     → preferred_username / upn / email from the ID token
  */
@@ -54,7 +47,7 @@ definePreScript(({ set, log }) => {
   };
 
   // ---------------------------------------------------------------------------
-  // Path 1: MSAL localStorage observer (classic Teams)
+  // Path 1: MSAL localStorage observer
   // ---------------------------------------------------------------------------
 
   /**
@@ -108,33 +101,7 @@ definePreScript(({ set, log }) => {
   };
 
   // ---------------------------------------------------------------------------
-  // Path 2: Loki token observer (Teams v2 readiness signal)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Teams v2 (teams.microsoft.com/v2/) stores a Loki bearer token as a raw JWT
-   * string in sessionStorage under the key `LokiAuthToken`. This token is used
-   * only as a readiness signal — its audience is the Loki service, not the
-   * Skype API, so it cannot be used directly for authsvc or chat APIs. The Skype
-   * JWT is captured separately via the authsvc fetch interceptor (Path 3).
-   */
-  const inspectLokiEntry = (key: string, value: string): void => {
-    if (!key.startsWith('LokiAuthToken') || key.startsWith('EXPLoki')) return;
-    if (typeof value !== 'string' || !value.startsWith('eyJ')) return;
-    // LokiAuthToken is enterprise-only (teams.microsoft.com), not consumer.
-    if (typeof window !== 'undefined' && window.location.hostname === 'teams.live.com') return;
-
-    const claims = decodeJwtClaims(value);
-    if (!claims) return;
-    const expiresOn = typeof claims.exp === 'number' ? claims.exp : 0;
-    if (!expiresOn || expiresOn <= Date.now() / 1000) return;
-
-    set('lokiToken', { secret: value, expiresOn } as CapturedToken);
-    log.debug('[teams] captured lokiToken from LokiAuthToken (readiness signal)');
-  };
-
-  // ---------------------------------------------------------------------------
-  // Path 3: authsvc fetch interceptor (Teams v2 Skype JWT)
+  // Path 2: authsvc fetch interceptor (Skype JWT)
   // ---------------------------------------------------------------------------
 
   /**
@@ -207,7 +174,7 @@ definePreScript(({ set, log }) => {
   // Initial scans
   // ---------------------------------------------------------------------------
 
-  // localStorage: MSAL credential entries (classic Teams, Path 1).
+  // localStorage: MSAL credential entries (Path 1).
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
@@ -219,20 +186,8 @@ definePreScript(({ set, log }) => {
     // localStorage access can throw under sandboxing; ignore.
   }
 
-  // sessionStorage: LokiAuthToken JWT (Teams v2, Path 2).
-  try {
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const key = sessionStorage.key(i);
-      if (!key) continue;
-      const val = sessionStorage.getItem(key);
-      if (val) inspectLokiEntry(key, val);
-    }
-  } catch {
-    // sessionStorage access can throw under sandboxing; ignore.
-  }
-
   // ---------------------------------------------------------------------------
-  // setItem hooks (Path 1 + Path 2)
+  // setItem hook (Path 1)
   // ---------------------------------------------------------------------------
 
   // Idempotent: if the prototype is already patched (re-injection during
@@ -245,7 +200,6 @@ definePreScript(({ set, log }) => {
     Storage.prototype.setItem = function patchedSetItem(key: string, value: string) {
       try {
         if (this === localStorage) inspect(value);
-        if (this === sessionStorage) inspectLokiEntry(key, value);
       } catch {
         // Never break the page if our observer throws.
       }
