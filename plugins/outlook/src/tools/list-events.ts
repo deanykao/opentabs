@@ -1,5 +1,6 @@
 import { defineTool } from '@opentabs-dev/plugin-sdk';
 import { z } from 'zod';
+import { resolveTimeZone } from '../calendar-settings.js';
 import { api } from '../outlook-api.js';
 import { EVENT_SUMMARY_FIELDS, type RawEvent, eventSummarySchema, mapEventSummary } from './calendar-schemas.js';
 
@@ -23,7 +24,7 @@ export const listEvents = defineTool({
       .string()
       .optional()
       .describe(
-        'IANA or Windows time zone to return start/end times in (e.g. "Eastern Standard Time"). Defaults to UTC.',
+        'IANA or Windows time zone to return start/end times in (e.g. "Eastern Standard Time"). Defaults to your mailbox time zone.',
       ),
   }),
   output: z.object({
@@ -31,6 +32,7 @@ export const listEvents = defineTool({
     total_count: z.number().optional().describe('Total count if available'),
   }),
   handle: async params => {
+    const tz = await resolveTimeZone(params.time_zone);
     const endpoint = params.calendar_id
       ? `/me/calendars/${encodeURIComponent(params.calendar_id)}/events`
       : '/me/events';
@@ -45,10 +47,7 @@ export const listEvents = defineTool({
           $filter: params.filter,
           $count: true,
         },
-        headers: {
-          ConsistencyLevel: 'eventual',
-          ...(params.time_zone ? { Prefer: `outlook.timezone="${params.time_zone}"` } : {}),
-        },
+        headers: { ConsistencyLevel: 'eventual', Prefer: `outlook.timezone="${tz}"` },
       },
       'calendar',
     );

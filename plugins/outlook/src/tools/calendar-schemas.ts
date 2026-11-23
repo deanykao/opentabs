@@ -1,6 +1,41 @@
 import { z } from 'zod';
 import { type RawEmailAddress, emailAddressSchema, mapEmailAddress } from './schemas.js';
 
+// ── Input date / time strings ─────────────────────────────────────────────
+//
+// Plain regex patterns, never `z.iso.*`: those emit a JSON Schema `format` keyword
+// that the MCP server's strict Ajv validator rejects ("unknown format"), which makes
+// the whole tool uncallable. `date-time` would also demand an offset, which local
+// times paired with a named time zone deliberately omit.
+
+const DATE = '\\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\\d|3[01])';
+const TIME = '(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d{1,7})?)?';
+
+/** Local wall-clock date-time with no offset, e.g. `2026-06-02T13:00:00`. */
+export const localDateTimeSchema = z
+  .string()
+  .regex(
+    new RegExp(`^${DATE}T${TIME}$`),
+    'Expected a local ISO 8601 date-time without offset, e.g. 2026-06-02T13:00:00',
+  );
+
+/** Date-time with an optional `Z` or `±hh:mm` offset, e.g. `2026-06-02T00:00:00-05:00`. */
+export const offsetDateTimeSchema = z
+  .string()
+  .regex(
+    new RegExp(`^${DATE}T${TIME}(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)?$`),
+    'Expected an ISO 8601 date-time, e.g. 2026-06-02T00:00:00-05:00',
+  );
+
+/** Calendar date, e.g. `2026-06-02`. */
+export const dateOnlySchema = z.string().regex(new RegExp(`^${DATE}$`), 'Expected a date as YYYY-MM-DD');
+
+/**
+ * Outlook REST returns PascalCase enum values (`Busy`, `TeamsForBusiness`) where
+ * Graph returns camelCase (`busy`, `teamsForBusiness`). Normalize to Graph's form.
+ */
+export const toCamelEnum = (value: string): string => value.charAt(0).toLowerCase() + value.slice(1);
+
 // ── Date / time ───────────────────────────────────────────────────────────
 
 export const dateTimeZoneSchema = z.object({
@@ -39,8 +74,8 @@ export const mapAttendee = (a: RawAttendee) => {
   return {
     name,
     address,
-    type: a.type ?? 'required',
-    response: a.status?.response ?? 'none',
+    type: toCamelEnum(a.type ?? 'required'),
+    response: toCamelEnum(a.status?.response ?? 'none'),
   };
 };
 
@@ -73,7 +108,7 @@ export interface RawCalendar {
 export const mapCalendar = (c: RawCalendar) => ({
   id: c.id ?? '',
   name: c.name ?? '',
-  color: c.color ?? 'auto',
+  color: toCamelEnum(c.color ?? 'auto'),
   hex_color: c.hexColor ?? '',
   is_default: c.isDefaultCalendar ?? false,
   can_edit: c.canEdit ?? false,
@@ -84,6 +119,69 @@ export const mapCalendar = (c: RawCalendar) => ({
     address: c.owner?.address ?? '',
   },
 });
+
+// ── Recurrence ─────────────────────────────────────────────────────────────
+
+export const recurrenceSchema = z.object({
+  pattern: z.object({
+    type: z.string().describe('daily, weekly, absoluteMonthly, relativeMonthly, absoluteYearly, relativeYearly'),
+    interval: z.number().describe('Units between occurrences'),
+    days_of_week: z.array(z.string()).describe('Days the event recurs on (weekly / relative patterns)'),
+    day_of_month: z.number().describe('Day of the month (absolute patterns; 0 when unused)'),
+    month: z.number().describe('Month of the year (yearly patterns; 0 when unused)'),
+    index: z.string().describe('Week of the month for relative patterns (first..last)'),
+    first_day_of_week: z.string().describe('First day of the week'),
+  }),
+  range: z.object({
+    type: z.string().describe('endDate, noEnd, or numbered'),
+    start_date: z.string().describe('First date of the series (YYYY-MM-DD)'),
+    end_date: z.string().describe('Last date of the series for endDate ranges'),
+    number_of_occurrences: z.number().describe('Occurrence count for numbered ranges (0 when unused)'),
+    recurrence_time_zone: z.string().describe('Time zone the recurrence is evaluated in'),
+  }),
+});
+
+export interface RawRecurrence {
+  pattern?: {
+    type?: string;
+    interval?: number;
+    daysOfWeek?: string[];
+    dayOfMonth?: number;
+    month?: number;
+    index?: string;
+    firstDayOfWeek?: string;
+  };
+  range?: {
+    type?: string;
+    startDate?: string;
+    endDate?: string;
+    numberOfOccurrences?: number;
+    recurrenceTimeZone?: string;
+  };
+}
+
+export const mapRecurrence = (r: RawRecurrence | null | undefined) =>
+  r?.pattern
+    ? {
+        pattern: {
+          type: toCamelEnum(r.pattern.type ?? ''),
+          interval: r.pattern.interval ?? 1,
+          days_of_week: (r.pattern.daysOfWeek ?? []).map(toCamelEnum),
+          day_of_month: r.pattern.dayOfMonth ?? 0,
+          month: r.pattern.month ?? 0,
+          index: toCamelEnum(r.pattern.index ?? 'first'),
+          first_day_of_week: toCamelEnum(r.pattern.firstDayOfWeek ?? 'sunday'),
+        },
+        range: {
+          type: toCamelEnum(r.range?.type ?? ''),
+          start_date: r.range?.startDate ?? '',
+          // Graph and REST report "0001-01-01" for ranges without an end date.
+          end_date: r.range?.endDate && !r.range.endDate.startsWith('0001-') ? r.range.endDate : '',
+          number_of_occurrences: r.range?.numberOfOccurrences ?? 0,
+          recurrence_time_zone: r.range?.recurrenceTimeZone ?? '',
+        },
+      }
+    : null;
 
 // ── Event ──────────────────────────────────────────────────────────────────
 
@@ -98,7 +196,9 @@ export const eventSummarySchema = z.object({
   is_cancelled: z.boolean().describe('Whether the event has been cancelled'),
   show_as: z.string().describe('Free/busy status (free, tentative, busy, oof, workingElsewhere, unknown)'),
   is_online_meeting: z.boolean().describe('Whether the event is an online meeting'),
-  online_meeting_url: z.string().describe('Join URL for the online meeting, if any'),
+  online_meeting_url: z
+    .string()
+    .describe('Join URL for the online meeting, if any (also detected from a Teams/Zoom/Webex/Meet link in the body)'),
   type: z.string().describe('Event type (singleInstance, occurrence, exception, seriesMaster)'),
   response_status: z
     .string()
@@ -118,8 +218,10 @@ export const eventDetailSchema = eventSummarySchema.extend({
   reminder_minutes_before_start: z.number().describe('Minutes before start the reminder fires'),
   has_attachments: z.boolean().describe('Whether the event has attachments'),
   response_requested: z.boolean().describe('Whether the organizer requested a response'),
+  allow_new_time_proposals: z.boolean().describe('Whether invitees may propose a new time'),
   series_master_id: z.string().describe('ID of the series master, for occurrences/exceptions'),
   is_recurring: z.boolean().describe('Whether the event is part of a recurring series'),
+  recurrence: recurrenceSchema.nullable().describe('Recurrence pattern and range, for series masters'),
   created_at: z.string().describe('Creation datetime (ISO 8601)'),
   last_modified_at: z.string().describe('Last modified datetime (ISO 8601)'),
 });
@@ -137,7 +239,8 @@ export interface RawEvent {
   attendees?: RawAttendee[];
   isCancelled?: boolean;
   isOnlineMeeting?: boolean;
-  onlineMeeting?: { joinUrl?: string };
+  onlineMeeting?: { joinUrl?: string } | null;
+  onlineMeetingUrl?: string | null;
   showAs?: string;
   type?: string;
   responseStatus?: { response?: string; time?: string };
@@ -148,62 +251,96 @@ export interface RawEvent {
   reminderMinutesBeforeStart?: number;
   hasAttachments?: boolean;
   responseRequested?: boolean;
+  allowNewTimeProposals?: boolean;
   seriesMasterId?: string;
-  recurrence?: unknown;
+  recurrence?: RawRecurrence | null;
   webLink?: string;
   createdDateTime?: string;
   lastModifiedDateTime?: string;
 }
 
-export const mapEventSummary = (e: RawEvent) => ({
-  id: e.id ?? '',
-  subject: e.subject ?? '(no subject)',
-  start: mapDateTimeZone(e.start),
-  end: mapDateTimeZone(e.end),
-  is_all_day: e.isAllDay ?? false,
-  location: e.location?.displayName ?? '',
-  organizer: mapEmailAddress(e.organizer ?? {}),
-  is_cancelled: e.isCancelled ?? false,
-  show_as: e.showAs ?? 'unknown',
-  is_online_meeting: e.isOnlineMeeting ?? false,
-  online_meeting_url: e.onlineMeeting?.joinUrl ?? '',
-  type: e.type ?? 'singleInstance',
-  response_status: e.responseStatus?.response ?? 'none',
-  web_link: e.webLink ?? '',
-  preview: e.bodyPreview ?? '',
-});
+/** Join links of the common meeting services, as they appear in invitation bodies. */
+const MEETING_JOIN_URL = new RegExp(
+  [
+    'https://teams\\.(?:microsoft|live)\\.com/(?:l/meetup-join|meet)/',
+    'https://[\\w.-]*zoom\\.us/(?:j|w|my)/',
+    'https://[\\w.-]+\\.webex\\.com/(?:meet|join|[\\w.-]+/j\\.php)',
+    'https://meet\\.google\\.com/[a-z]',
+  ]
+    .map(prefix => `${prefix}[^\\s"'<>]*`)
+    .join('|'),
+  'i',
+);
 
-export const mapEventDetail = (e: RawEvent) => ({
-  ...mapEventSummary(e),
-  body_type: e.body?.contentType ?? 'text',
-  body: e.body?.content ?? '',
-  attendees: (e.attendees ?? []).map(mapAttendee),
-  importance: e.importance ?? 'normal',
-  sensitivity: e.sensitivity ?? 'normal',
-  categories: e.categories ?? [],
-  is_reminder_on: e.isReminderOn ?? false,
-  reminder_minutes_before_start: e.reminderMinutesBeforeStart ?? 0,
-  has_attachments: e.hasAttachments ?? false,
-  response_requested: e.responseRequested ?? false,
-  series_master_id: e.seriesMasterId ?? '',
-  is_recurring: Boolean(e.recurrence) || e.type === 'seriesMaster' || e.type === 'occurrence' || e.type === 'exception',
-  created_at: e.createdDateTime ?? '',
-  last_modified_at: e.lastModifiedDateTime ?? '',
-});
+/**
+ * The event's online-meeting join URL. Meetings added by a meeting-service add-in
+ * (Teams, Zoom, Webex) carry no `onlineMeeting` data — the link only exists in the
+ * body, so fall back to the first join link in the body, then the body preview.
+ */
+export const extractJoinUrl = (e: RawEvent): string => {
+  const structured = e.onlineMeeting?.joinUrl || e.onlineMeetingUrl;
+  if (structured) return structured;
+  const match = e.body?.content?.match(MEETING_JOIN_URL) ?? e.bodyPreview?.match(MEETING_JOIN_URL);
+  return match ? match[0].replace(/&amp;/g, '&') : '';
+};
 
-// ── Request-body builders (create / update) ─────────────────────────────────
+export const mapEventSummary = (e: RawEvent) => {
+  const joinUrl = extractJoinUrl(e);
+  return {
+    id: e.id ?? '',
+    subject: e.subject ?? '(no subject)',
+    start: mapDateTimeZone(e.start),
+    end: mapDateTimeZone(e.end),
+    is_all_day: e.isAllDay ?? false,
+    location: e.location?.displayName ?? '',
+    organizer: mapEmailAddress(e.organizer ?? {}),
+    is_cancelled: e.isCancelled ?? false,
+    show_as: toCamelEnum(e.showAs ?? 'unknown'),
+    is_online_meeting: (e.isOnlineMeeting ?? false) || joinUrl !== '',
+    online_meeting_url: joinUrl,
+    type: toCamelEnum(e.type ?? 'singleInstance'),
+    response_status: toCamelEnum(e.responseStatus?.response ?? 'none'),
+    web_link: e.webLink ?? '',
+    preview: e.bodyPreview ?? '',
+  };
+};
 
-/** Build a Graph/REST dateTimeTimeZone object. Times default to UTC when no zone given. */
-export const buildDateTime = (dateTime: string, timeZone?: string) => ({
-  dateTime,
-  timeZone: timeZone ?? 'UTC',
-});
+export const mapEventDetail = (e: RawEvent) => {
+  const summary = mapEventSummary(e);
+  return {
+    ...summary,
+    body_type: toCamelEnum(e.body?.contentType ?? 'text'),
+    body: e.body?.content ?? '',
+    attendees: (e.attendees ?? []).map(mapAttendee),
+    importance: toCamelEnum(e.importance ?? 'normal'),
+    sensitivity: toCamelEnum(e.sensitivity ?? 'normal'),
+    categories: e.categories ?? [],
+    is_reminder_on: e.isReminderOn ?? false,
+    reminder_minutes_before_start: e.reminderMinutesBeforeStart ?? 0,
+    has_attachments: e.hasAttachments ?? false,
+    response_requested: e.responseRequested ?? false,
+    allow_new_time_proposals: e.allowNewTimeProposals ?? true,
+    series_master_id: e.seriesMasterId ?? '',
+    is_recurring: Boolean(e.recurrence) || ['seriesMaster', 'occurrence', 'exception'].includes(summary.type),
+    recurrence: mapRecurrence(e.recurrence),
+    created_at: e.createdDateTime ?? '',
+    last_modified_at: e.lastModifiedDateTime ?? '',
+  };
+};
 
-/** Attendee shape accepted by create_event / update_event input. */
+// ── Request-body builders ───────────────────────────────────────────────────
+
+/** Build a Graph/REST dateTimeTimeZone object. */
+export const buildDateTime = (dateTime: string, timeZone: string) => ({ dateTime, timeZone });
+
+/** Attendee shape accepted by create_event / update_event / find_meeting_times input. */
 export const attendeeInputSchema = z.object({
   address: z.string().describe('Attendee email address'),
   name: z.string().optional().describe('Attendee display name'),
-  type: z.enum(['required', 'optional', 'resource']).optional().describe('Attendance type (default: required)'),
+  type: z
+    .enum(['required', 'optional', 'resource'])
+    .optional()
+    .describe('Attendance type (default: required). Use resource for rooms/equipment.'),
 });
 
 export interface AttendeeInput {
@@ -277,7 +414,7 @@ export const mapSchedule = (s: RawSchedule) => ({
   schedule_id: s.scheduleId ?? '',
   availability_view: s.availabilityView ?? '',
   items: (s.scheduleItems ?? []).map(item => ({
-    status: item.status ?? 'unknown',
+    status: toCamelEnum(item.status ?? 'unknown'),
     start: mapDateTimeZone(item.start),
     end: mapDateTimeZone(item.end),
     subject: item.subject ?? '',
@@ -288,7 +425,7 @@ export const mapSchedule = (s: RawSchedule) => ({
   })),
   working_hours: s.workingHours
     ? {
-        days_of_week: s.workingHours.daysOfWeek ?? [],
+        days_of_week: (s.workingHours.daysOfWeek ?? []).map(toCamelEnum),
         start_time: s.workingHours.startTime ?? '',
         end_time: s.workingHours.endTime ?? '',
         time_zone: s.workingHours.timeZone?.name ?? '',
@@ -302,4 +439,4 @@ export const mapSchedule = (s: RawSchedule) => ({
 export const EVENT_SUMMARY_FIELDS =
   'id,subject,start,end,isAllDay,location,organizer,isCancelled,showAs,isOnlineMeeting,onlineMeeting,type,responseStatus,webLink,bodyPreview';
 
-export const EVENT_DETAIL_FIELDS = `${EVENT_SUMMARY_FIELDS},body,attendees,importance,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,hasAttachments,responseRequested,seriesMasterId,recurrence,createdDateTime,lastModifiedDateTime`;
+export const EVENT_DETAIL_FIELDS = `${EVENT_SUMMARY_FIELDS},body,attendees,importance,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,hasAttachments,responseRequested,allowNewTimeProposals,seriesMasterId,recurrence,createdDateTime,lastModifiedDateTime`;

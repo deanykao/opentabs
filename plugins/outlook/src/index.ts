@@ -5,6 +5,8 @@ import { createDraft } from './tools/create-draft.js';
 import { createEvent } from './tools/create-event.js';
 import { deleteEvent } from './tools/delete-event.js';
 import { deleteMessage } from './tools/delete-message.js';
+import { findMeetingTimes } from './tools/find-meeting-times.js';
+import { forwardEvent } from './tools/forward-event.js';
 import { forwardMessage } from './tools/forward-message.js';
 import { downloadAttachment } from './tools/download-attachment.js';
 import { getAttachmentContent } from './tools/get-attachment-content.js';
@@ -15,9 +17,12 @@ import { getMessage } from './tools/get-message.js';
 import { getSchedule } from './tools/get-schedule.js';
 import { listAttachments } from './tools/list-attachments.js';
 import { listCalendars } from './tools/list-calendars.js';
+import { listEventInstances } from './tools/list-event-instances.js';
 import { listEvents } from './tools/list-events.js';
 import { listFolders } from './tools/list-folders.js';
 import { listMessages } from './tools/list-messages.js';
+import { listRoomLists } from './tools/list-room-lists.js';
+import { listRooms } from './tools/list-rooms.js';
 import { moveMessage } from './tools/move-message.js';
 import { replyToMessage } from './tools/reply-to-message.js';
 import { respondToEvent } from './tools/respond-to-event.js';
@@ -61,12 +66,17 @@ class OutlookPlugin extends OpenTabsPlugin {
     listCalendars,
     listEvents,
     getCalendarView,
+    listEventInstances,
     getEvent,
     createEvent,
     updateEvent,
     deleteEvent,
     respondToEvent,
+    forwardEvent,
     getSchedule,
+    findMeetingTimes,
+    listRoomLists,
+    listRooms,
   ];
 
   async isReady(): Promise<boolean> {

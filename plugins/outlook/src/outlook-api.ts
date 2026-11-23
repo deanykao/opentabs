@@ -11,6 +11,7 @@ import type { FetchFromPageOptions } from '@opentabs-dev/plugin-sdk';
 
 const GRAPH_API_BASE = 'https://graph.microsoft.com/v1.0';
 const OUTLOOK_API_BASE = 'https://outlook.office.com/api/v2.0';
+const OUTLOOK_API_BETA_BASE = 'https://outlook.office.com/api/beta';
 
 // Outlook enterprise MSAL client ID
 const MSAL_CLIENT_ID = '9199bf20-a13f-4107-85dc-02114787ef48';
@@ -20,18 +21,23 @@ const MSAL_CLIENT_ID_CONSUMER = '2821b473-fe24-4c86-ba16-62834d6e80c3';
 interface OutlookAuth {
   token: string;
   apiBase: string; // which API base URL this token works with
+  /**
+   * Lowercased scope names the token grants on its API host (e.g. `calendars.readwrite`).
+   * Undefined when the cache entry does not expose its scopes (MSAL v1).
+   */
+  scopes?: string[];
 }
 
 /**
  * A request capability. Mail and calendar can require different Graph scopes, and
  * a single token is not guaranteed to carry both — enterprise tenants commonly
- * issue a narrowly-scoped Graph token alongside a broad Outlook REST token. The
- * `api()` cascade discovers the working token empirically (trying every candidate
- * on 401/403), so capability does not pre-filter candidates; it only selects an
- * independent cache slot. Separate slots stop a mail call and a calendar call from
- * evicting each other's winning token under one shared cache — which would make the
- * two endpoints repeatedly re-cascade against each other. Calendar read and write
- * are split so a mutating call never pins to a read-only token cached by a read.
+ * issue a narrowly-scoped Graph token (User.* only) alongside a broad Outlook REST
+ * token. Calendar capabilities rank candidates by their scope claim: tokens that
+ * grant the capability are tried first, tokens with unknown scopes (`.default`,
+ * MSAL v1) after, and tokens whose scopes provably lack it are skipped. A 403 from
+ * a token that grants the capability is a genuine permission denial and is surfaced
+ * as such instead of cascading. Each capability caches its winning token in its own
+ * slot so mail, calendar-read, and calendar-write never evict each other.
  */
 type Capability = 'mail' | 'calendar' | 'calendar-write';
 
@@ -40,6 +46,48 @@ const AUTH_CACHE_KEY: Record<Capability, string> = {
   mail: 'outlook',
   calendar: 'outlook-calendar',
   'calendar-write': 'outlook-calendar-write',
+};
+
+/** Scope a token must carry for a capability; `null` means no scope filtering. */
+const CAPABILITY_SCOPE: Record<Capability, RegExp | null> = {
+  mail: null,
+  calendar: /^calendars\./,
+  'calendar-write': /^calendars\.readwrite/,
+};
+
+type ScopeFit = 'grants' | 'unknown' | 'lacks';
+
+export const scopeFit = (auth: Pick<OutlookAuth, 'scopes'>, capability: Capability): ScopeFit => {
+  const required = CAPABILITY_SCOPE[capability];
+  if (!required) return 'unknown';
+  if (!auth.scopes) return 'unknown';
+  if (auth.scopes.some(s => required.test(s))) return 'grants';
+  return auth.scopes.includes('.default') ? 'unknown' : 'lacks';
+};
+
+/** Order candidates for a capability: granting tokens, then unknown; drop those that lack it. */
+export const rankCandidates = <A extends Pick<OutlookAuth, 'scopes'>>(candidates: A[], capability: Capability): A[] => {
+  const grants = candidates.filter(c => scopeFit(c, capability) === 'grants');
+  const unknown = candidates.filter(c => scopeFit(c, capability) === 'unknown');
+  return [...grants, ...unknown];
+};
+
+/**
+ * Endpoint addressing. A plain string is appended to whichever API base the token
+ * serves (Graph and Outlook REST share most paths) or, when absolute, is only sent
+ * with a token for that same base (OData `@odata.nextLink`). An object gives per-API
+ * paths for operations whose routes differ; a token for an API with no path is skipped.
+ */
+export type ApiEndpoint = string | { graph?: string; rest?: string; restVersion?: 'v2.0' | 'beta' };
+
+const resolveBase = (auth: OutlookAuth, endpoint: ApiEndpoint): { base: string; path: string } | null => {
+  if (typeof endpoint === 'string') {
+    if (!endpoint.startsWith('https://')) return { base: auth.apiBase, path: endpoint };
+    return endpoint.startsWith(`${auth.apiBase}/`) ? { base: '', path: endpoint } : null;
+  }
+  if (auth.apiBase === GRAPH_API_BASE) return endpoint.graph ? { base: GRAPH_API_BASE, path: endpoint.graph } : null;
+  if (!endpoint.rest) return null;
+  return { base: endpoint.restVersion === 'beta' ? OUTLOOK_API_BETA_BASE : OUTLOOK_API_BASE, path: endpoint.rest };
 };
 
 /**
@@ -65,21 +113,24 @@ const findAllMsalClientIds = (prefix: string): string[] => {
 };
 
 /**
- * True when the AAD scope claim (space-separated) contains at least one scope
- * whose URL hostname equals `host`. Each scope is parsed as a URL and compared
- * by `hostname` rather than substring-matched so a malicious value like
- * `https://attacker.com/graph.microsoft.com/foo` cannot satisfy the check.
+ * Scope names in the AAD scope claim (space-separated) whose URL hostname equals
+ * `host`, lowercased and stripped of leading slashes (`https://h//Calendars.Read` →
+ * `calendars.read`). Scopes are parsed as URLs and compared by `hostname` rather than
+ * substring-matched so a malicious value like `https://attacker.com/graph.microsoft.com/foo`
+ * cannot satisfy the check. An empty result means the claim grants nothing on `host`.
  */
-const scopeClaimHasHost = (target: string, host: string): boolean => {
+export const scopesForHost = (target: string, host: string): string[] => {
+  const scopes: string[] = [];
   for (const scope of target.split(/\s+/)) {
     if (scope.length === 0) continue;
     try {
-      if (new URL(scope).hostname.toLowerCase() === host) return true;
+      const url = new URL(scope);
+      if (url.hostname.toLowerCase() === host) scopes.push(url.pathname.replace(/^\/+/, '').toLowerCase());
     } catch {
       // non-URL scopes (openid, profile, email, ...) — skip
     }
   }
-  return false;
+  return scopes;
 };
 
 /**
@@ -108,15 +159,15 @@ const findMsalModernTokens = (version: '2' | '3', clientId: string, host: string
       const parsed = JSON.parse(raw);
       if (typeof parsed.secret !== 'string' || parsed.secret.length === 0) continue;
 
-      const target: string = parsed.target ?? '';
-      if (!scopeClaimHasHost(target, host)) continue;
+      const scopes = scopesForHost(parsed.target ?? '', host);
+      if (scopes.length === 0) continue;
 
       // Strict numeric coercion — Number.parseInt would accept '9999999999junk'
       // as a giant future expiry; Number(...) returns NaN for trailing garbage.
       const expiresOn = Number(parsed.expiresOn);
       if (!Number.isInteger(expiresOn) || expiresOn <= 0 || expiresOn * 1000 < Date.now()) continue;
 
-      matches.push({ token: parsed.secret, apiBase });
+      matches.push({ token: parsed.secret, apiBase, scopes });
     } catch {
       // skip invalid entries
     }
@@ -230,38 +281,66 @@ const normalizeKeys = (obj: unknown): unknown => {
 const toPascalCase = (str: string): string => str.charAt(0).toUpperCase() + str.slice(1);
 
 /**
+ * Outlook REST property names that are not the PascalCase of their Graph name.
+ * `timeConstraint.timeSlots` is `TimeConstraint.Timeslots` on REST v2.0.
+ */
+const REST_KEY_OVERRIDES: Record<string, string> = { timeSlots: 'Timeslots' };
+
+/**
  * Recursively convert object keys to PascalCase.
  * The Outlook REST API deserializes request bodies case-sensitively and requires
  * PascalCase property names for both entities (Subject, Start/DateTime) and OData
  * action parameters (Schedules, Comment). Graph uses camelCase. Request bodies are
  * authored in camelCase and transformed here when the request targets the REST base;
  * GET query options ($filter, $orderby) are case-insensitive on REST and unaffected.
+ * Enum values are left as authored — REST accepts Graph's camelCase enum values.
  */
-const pascalCaseKeys = (obj: unknown): unknown => {
+export const pascalCaseKeys = (obj: unknown): unknown => {
   if (obj === null || obj === undefined || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(pascalCaseKeys);
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-    result[toPascalCase(key)] = pascalCaseKeys(value);
+    result[REST_KEY_OVERRIDES[key] ?? toPascalCase(key)] = pascalCaseKeys(value);
   }
   return result;
 };
 
+interface RequestOptions {
+  method?: string;
+  body?: unknown;
+  query?: Record<string, string | number | boolean | undefined>;
+  headers?: Record<string, string>;
+}
+
+type RequestOutcome<T> =
+  | { kind: 'ok'; data: T }
+  /** The token's API has no route for this endpoint — try the next candidate. */
+  | { kind: 'unsupported' }
+  /** 401/403 — the token was rejected; `message` is the server's error text. */
+  | { kind: 'rejected'; status: number; message: string };
+
+const readErrorMessage = async (response: Response): Promise<string | undefined> => {
+  try {
+    const errBody = (await response.json()) as { error?: { message?: string } };
+    return errBody.error?.message;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * Send an authenticated request and handle the response.
- * Returns the parsed response or throws on error.
- * On 401/403, returns `null` to signal the caller to retry with a fresh token.
+ * Returns the parsed response, `unsupported` when the token's API has no route for
+ * the endpoint, or `rejected` on 401/403 so the caller can decide whether to cascade.
+ * Throws on every other error.
  */
 const sendRequest = async <T>(
   auth: OutlookAuth,
-  endpoint: string,
-  options: {
-    method?: string;
-    body?: unknown;
-    query?: Record<string, string | number | boolean | undefined>;
-    headers?: Record<string, string>;
-  },
-): Promise<T | null> => {
+  endpoint: ApiEndpoint,
+  options: RequestOptions,
+): Promise<RequestOutcome<T>> => {
+  const target = resolveBase(auth, endpoint);
+  if (!target) return { kind: 'unsupported' };
   const isOutlookApi = auth.apiBase === OUTLOOK_API_BASE;
 
   // Outlook REST API uses different $select field names, so drop $select
@@ -272,7 +351,7 @@ const sendRequest = async <T>(
   }
 
   const qs = query ? buildQueryString(query) : '';
-  const url = qs ? `${auth.apiBase}${endpoint}?${qs}` : `${auth.apiBase}${endpoint}`;
+  const url = qs ? `${target.base}${target.path}?${qs}` : `${target.base}${target.path}`;
   const method = options.method ?? 'GET';
 
   const headers: Record<string, string> = {
@@ -308,7 +387,7 @@ const sendRequest = async <T>(
     });
   }
 
-  if (response.status === 204) return {} as T;
+  if (response.status === 204) return { kind: 'ok', data: {} as T };
 
   if (response.status === 429) {
     const retryAfter = response.headers.get('Retry-After');
@@ -316,25 +395,17 @@ const sendRequest = async <T>(
     throw ToolError.rateLimited('Microsoft API rate limit exceeded.', retryMs);
   }
 
-  // Signal caller to retry with a fresh token
-  if (response.status === 401 || response.status === 403) return null;
+  if (response.status === 401 || response.status === 403) {
+    const message = (await readErrorMessage(response)) ?? `Microsoft API error (${response.status})`;
+    return { kind: 'rejected', status: response.status, message };
+  }
 
   if (response.status === 404) {
     throw ToolError.notFound('The requested resource was not found.');
   }
 
   if (!response.ok) {
-    let errorMsg = `Microsoft API error (${response.status})`;
-    try {
-      const errBody = (await response.json()) as {
-        error?: { message?: string; code?: string };
-      };
-      if (errBody.error?.message) {
-        errorMsg = errBody.error.message;
-      }
-    } catch {
-      // ignore parse errors
-    }
+    const errorMsg = (await readErrorMessage(response)) ?? `Microsoft API error (${response.status})`;
     if (response.status === 400 || response.status === 422) {
       throw ToolError.validation(errorMsg);
     }
@@ -344,60 +415,98 @@ const sendRequest = async <T>(
   // Successful actions (cancel, RSVP, sendMail) often return 202/205 or a 200 with
   // an empty body and no JSON. Only parse when the response actually carries JSON.
   const contentType = response.headers.get('content-type') ?? '';
-  if (!contentType.includes('application/json')) return {} as T;
+  if (!contentType.includes('application/json')) return { kind: 'ok', data: {} as T };
 
   const json = await response.json();
-  return (isOutlookApi ? normalizeKeys(json) : json) as T;
+  return { kind: 'ok', data: (isOutlookApi ? normalizeKeys(json) : json) as T };
 };
 
 /**
  * Make an authenticated request to a Microsoft 365 API for the given capability,
- * cascading through every MSAL-cached candidate on 401/403 (the capability's cached
- * winner first) and caching the first that succeeds under that capability's slot.
- * Mail requests default to the `mail` capability; calendar tools pass `calendar` or
- * `calendar-write` so their winning token is cached separately and never thrashes a
- * mail-only token. Automatically uses whichever API the resolved token supports
- * (Graph or Outlook REST). Throws an auth error only after every candidate fails.
+ * trying the capability's cached winner first, then every MSAL-cached candidate
+ * ranked by scope (see `Capability`), and caching the first that succeeds under the
+ * capability's slot. Automatically uses whichever API the resolved token supports
+ * (Graph or Outlook REST). A 403 from a token whose scopes grant the capability is
+ * reported as a permission denial with the server's message; otherwise 401/403
+ * cascade to the next candidate.
  */
 export const api = async <T>(
-  endpoint: string,
-  options: {
-    method?: string;
-    body?: unknown;
-    query?: Record<string, string | number | boolean | undefined>;
-    headers?: Record<string, string>;
-  } = {},
+  endpoint: ApiEndpoint,
+  options: RequestOptions = {},
   capability: Capability = 'mail',
 ): Promise<T> => {
   const cacheKey = AUTH_CACHE_KEY[capability];
+  let lastRejection: { status: number; message: string } | undefined;
+
+  const attempt = async (auth: OutlookAuth): Promise<{ data: T } | null> => {
+    const outcome = await sendRequest<T>(auth, endpoint, options);
+    if (outcome.kind === 'ok') return { data: outcome.data };
+    if (outcome.kind === 'rejected') {
+      if (outcome.status === 403 && scopeFit(auth, capability) === 'grants') {
+        throw ToolError.auth(`Microsoft 365 denied this request: ${outcome.message}`, 'PERMISSION_DENIED');
+      }
+      lastRejection = outcome;
+    }
+    return null;
+  };
 
   const cached = getAuthCache<OutlookAuth>(cacheKey);
   if (cached) {
-    const r = await sendRequest<T>(cached, endpoint, options);
-    if (r !== null) return r;
-    clearAuthCache(cacheKey);
+    const r = await attempt(cached);
+    if (r) return r.data;
+    if (lastRejection) clearAuthCache(cacheKey);
   }
 
-  const candidates = collectAuthCandidates();
-  // Skip the cached candidate we just tried — it 401'd, no point retrying it.
+  const candidates = rankCandidates(collectAuthCandidates(), capability);
+  // Skip the cached candidate we just tried.
   const remaining = cached ? candidates.filter(c => c.token !== cached.token) : candidates;
-  if (remaining.length === 0) {
-    throw ToolError.auth(
-      cached
-        ? 'Authentication expired — please refresh the Outlook page.'
-        : 'Not authenticated — please sign in to Microsoft 365.',
-    );
+  if (remaining.length === 0 && !lastRejection) {
+    throw ToolError.auth('Not authenticated — please sign in to Microsoft 365.');
   }
 
   for (const auth of remaining) {
-    const r = await sendRequest<T>(auth, endpoint, options);
-    if (r !== null) {
+    const r = await attempt(auth);
+    if (r) {
       setAuthCache(cacheKey, auth);
-      return r;
+      return r.data;
     }
   }
 
-  throw ToolError.auth('Authentication expired — please refresh the Outlook page.');
+  if (lastRejection?.status === 403) {
+    throw ToolError.auth(`Microsoft 365 denied this request: ${lastRejection.message}`, 'PERMISSION_DENIED');
+  }
+  if (lastRejection) throw ToolError.auth('Authentication expired — please refresh the Outlook page.');
+  throw ToolError.validation('No signed-in Microsoft 365 API supports this operation for your account.');
+};
+
+interface ODataPage<T> {
+  value?: T[];
+  '@odata.nextLink'?: string;
+}
+
+/**
+ * Fetch an OData collection, following `@odata.nextLink` until `limit` items are
+ * collected or the collection ends. Next links are absolute URLs on the API that
+ * served the first page; `api()` only sends them with a token for that same base.
+ */
+export const apiPaged = async <T>(
+  endpoint: ApiEndpoint,
+  options: RequestOptions,
+  capability: Capability,
+  limit: number,
+): Promise<{ items: T[]; hasMore: boolean }> => {
+  const items: T[] = [];
+  let page = await api<ODataPage<T>>(endpoint, options, capability);
+  for (;;) {
+    for (const item of page.value ?? []) {
+      if (items.length === limit) return { items, hasMore: true };
+      items.push(item);
+    }
+    const next = page['@odata.nextLink'];
+    if (!next) return { items, hasMore: false };
+    if (items.length === limit) return { items, hasMore: true };
+    page = await api<ODataPage<T>>(next, { headers: options.headers }, capability);
+  }
 };
 
 // OWS gateway lives on the OWA page's own origin — a third base distinct from Graph
